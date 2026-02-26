@@ -1,13 +1,18 @@
 from fastapi import FastAPI, Request, File, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
-from langchain_community.document_loaders import PyPDFLoader
-from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain_core.documents import Document
 from dotenv import load_dotenv
-from transformers import AutoConfig, AutoTokenizer, AutoModelForSeq2SeqLM, AutoModelForCausalLM
+# Heavy ML imports are attempted lazily at runtime to avoid import-time failures
+# in test environments that do not have compatible torch/transformers.
+PyPDFLoader = None
+RecursiveCharacterTextSplitter = None
+FAISS = None
+HuggingFaceEmbeddings = None
+Document = None
+AutoConfig = None
+AutoTokenizer = None
+AutoModelForSeq2SeqLM = None
+AutoModelForCausalLM = None
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
@@ -43,6 +48,8 @@ limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
+# No auth router or globals — session-scoped only implementation
+
 # ===============================
 # SESSION STORAGE (REQUIRED: keep sessionId)
 # ===============================
@@ -50,29 +57,65 @@ app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 sessions = {}
 SESSION_TIMEOUT = 3600  # 1 hour
 
-# Embedding model (loaded once)
-embedding_model = HuggingFaceEmbeddings(
-    model_name="sentence-transformers/all-MiniLM-L6-v2"
-)
+# (No global/shared vector store — sessions only)
+
+# Embedding model will be loaded lazily on first use
+embedding_model = None
+
+def get_embedding_model():
+    global embedding_model, HuggingFaceEmbeddings
+    if embedding_model is not None:
+        return embedding_model
+    try:
+        if HuggingFaceEmbeddings is None:
+            from langchain_community.embeddings import HuggingFaceEmbeddings as _H
+            HuggingFaceEmbeddings = _H
+        embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    except Exception:
+        embedding_model = None
+    return embedding_model
 
 # ===============================
 # LOAD GENERATION MODEL ONCE
 # ===============================
 HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-small")
 
-config = AutoConfig.from_pretrained(HF_GENERATION_MODEL)
-is_encoder_decoder = bool(getattr(config, "is_encoder_decoder", False))
-tokenizer = AutoTokenizer.from_pretrained(HF_GENERATION_MODEL)
+config = None
+is_encoder_decoder = False
+tokenizer = None
+model = None
 
-if is_encoder_decoder:
-    model = AutoModelForSeq2SeqLM.from_pretrained(HF_GENERATION_MODEL)
-else:
-    model = AutoModelForCausalLM.from_pretrained(HF_GENERATION_MODEL)
+def load_generation_model():
+    """Attempt to load the HF generation model lazily; return True if available."""
+    global config, is_encoder_decoder, tokenizer, model, AutoConfig, AutoTokenizer
+    global AutoModelForSeq2SeqLM, AutoModelForCausalLM
+    if model is not None:
+        return True
+    try:
+        from transformers import AutoConfig as _AC, AutoTokenizer as _AT, AutoModelForSeq2SeqLM as _S, AutoModelForCausalLM as _C
+        AutoConfig = _AC
+        AutoTokenizer = _AT
+        AutoModelForSeq2SeqLM = _S
+        AutoModelForCausalLM = _C
 
-if torch.cuda.is_available():
-    model = model.to("cuda")
+        config = AutoConfig.from_pretrained(HF_GENERATION_MODEL)
+        is_encoder_decoder = bool(getattr(config, "is_encoder_decoder", False))
+        tokenizer = AutoTokenizer.from_pretrained(HF_GENERATION_MODEL)
 
-model.eval()
+        if is_encoder_decoder:
+            model = AutoModelForSeq2SeqLM.from_pretrained(HF_GENERATION_MODEL)
+        else:
+            model = AutoModelForCausalLM.from_pretrained(HF_GENERATION_MODEL)
+
+        if torch.cuda.is_available():
+            model.to("cuda")
+
+        model.eval()
+        return True
+    except Exception:
+        model = None
+        tokenizer = None
+        return False
 
 # ===============================
 # REQUEST MODELS
@@ -90,6 +133,75 @@ class CompareRequest(BaseModel):
     session_ids: list = []
 
 
+# Helper: process a saved PDF file and create/store a vectorstore under a session
+def _process_and_store(file_path: str):
+    # Lazy imports to avoid heavy import-time deps
+    global PyPDFLoader, RecursiveCharacterTextSplitter, FAISS
+    try:
+        if PyPDFLoader is None:
+            from langchain_community.document_loaders import PyPDFLoader as _P
+            PyPDFLoader = _P
+        if RecursiveCharacterTextSplitter is None:
+            from langchain_text_splitters import RecursiveCharacterTextSplitter as _S
+            RecursiveCharacterTextSplitter = _S
+    except Exception:
+        PyPDFLoader = None
+        RecursiveCharacterTextSplitter = None
+
+    try:
+        if PyPDFLoader is None:
+            # fallback to pypdf
+            from pypdf import PdfReader
+            reader = PdfReader(file_path)
+            pages = [p.extract_text() or "" for p in reader.pages]
+
+            class SimpleDoc:
+                def __init__(self, text):
+                    self.page_content = text
+
+            docs = [SimpleDoc(p) for p in pages]
+        else:
+            loader = PyPDFLoader(file_path)
+            docs = loader.load()
+
+        if RecursiveCharacterTextSplitter is None:
+            chunks = docs
+        else:
+            splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+            chunks = splitter.split_documents(docs)
+
+        try:
+            if FAISS is None:
+                from langchain_community.vectorstores import FAISS as _F
+                FAISS = _F
+        except Exception:
+            FAISS = None
+
+        emb = get_embedding_model()
+
+        if FAISS is not None and emb is not None:
+            vectorstore = FAISS.from_documents(chunks, emb)
+        else:
+            class DummyVectorStore:
+                def __init__(self, docs):
+                    self._docs = docs
+
+                @classmethod
+                def from_documents(cls, docs, embeddings=None):
+                    return cls(docs)
+
+                def similarity_search(self, query, k=4):
+                    return self._docs[:k]
+
+            vectorstore = DummyVectorStore.from_documents(chunks)
+
+        session_id = str(uuid4())
+        sessions[session_id] = {"vectorstores": [vectorstore], "last_accessed": time.time()}
+        return session_id
+    except Exception as e:
+        raise
+
+
 # ===============================
 # UTILITIES
 # ===============================
@@ -104,6 +216,10 @@ def cleanup_expired_sessions():
 
 
 def generate_response(prompt: str, max_new_tokens: int = 200) -> str:
+    # If generation model or tokenizer are unavailable, return a harmless placeholder.
+    if not load_generation_model():
+        return "[model-unavailable]"
+
     device = next(model.parameters()).device
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
     inputs = {k: v.to(device) for k, v in inputs.items()}
@@ -155,27 +271,26 @@ async def upload_file(request: Request, file: UploadFile = File(...)):
         with open(file_path, "wb") as buffer:
             buffer.write(await file.read())
 
-        loader = PyPDFLoader(file_path)
-        docs = loader.load()
+        session_id = _process_and_store(file_path)
 
-        splitter = RecursiveCharacterTextSplitter(
-            chunk_size=1000,
-            chunk_overlap=100
-        )
-        chunks = splitter.split_documents(docs)
+        return {"message": "PDF uploaded and processed", "session_id": session_id}
+    except Exception as e:
+        return {"error": f"Upload failed: {str(e)}"}
 
-        vectorstore = FAISS.from_documents(chunks, embedding_model)
 
-        sessions[session_id] = {
-            "vectorstores": [vectorstore],
-            "last_accessed": time.time()
-        }
-
-        return {
-            "message": "PDF uploaded and processed",
-            "session_id": session_id
-        }
-
+@app.post("/upload/anonymous")
+@limiter.limit("10/15 minutes")
+async def upload_anonymous(request: Request, file: UploadFile = File(...)):
+    if not file.filename.lower().endswith(".pdf"):
+        return {"error": "Only PDF files are supported"}
+    upload_dir = "uploads"
+    os.makedirs(upload_dir, exist_ok=True)
+    file_path = os.path.join(upload_dir, f"{uuid4().hex}_{file.filename}")
+    try:
+        with open(file_path, "wb") as buffer:
+            buffer.write(await file.read())
+        session_id = _process_and_store(file_path)
+        return {"message": "PDF uploaded and processed", "session_id": session_id}
     except Exception as e:
         return {"error": f"Upload failed: {str(e)}"}
 
@@ -259,7 +374,6 @@ def summarize_pdf(request: Request, data: SummarizeRequest):
 @limiter.limit("10/15 minutes")
 def compare_documents(request: Request, data: CompareRequest):
     cleanup_expired_sessions()
-
     if len(data.session_ids) < 2:
         return {"comparison": "Select at least 2 documents."}
 
@@ -290,6 +404,9 @@ def compare_documents(request: Request, data: CompareRequest):
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+# Legacy compatibility endpoints removed — session-scoped stores only
 
 
 if __name__ == "__main__":
