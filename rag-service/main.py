@@ -1,4 +1,4 @@
-from fastapi import FastAPI, Request, File, UploadFile
+from fastapi import FastAPI, Request, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from dotenv import load_dotenv
@@ -20,13 +20,22 @@ from uuid import uuid4
 import os
 import time
 import uuid
-import torch
 import uvicorn
+import threading
+import logging
+from fastapi.responses import JSONResponse
 
 # IMPORTANT: Authentication REMOVED as per issue requirement
 # (Authentication was breaking existing endpoints)
 
 load_dotenv()
+
+# Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Thread-safety for sessions
+sessions_lock = threading.Lock()
 
 app = FastAPI(
     title="PDF QA Bot API",
@@ -107,8 +116,14 @@ def load_generation_model():
         else:
             model = AutoModelForCausalLM.from_pretrained(HF_GENERATION_MODEL)
 
-        if torch.cuda.is_available():
-            model.to("cuda")
+        # Guard CUDA usage — import torch locally to avoid module-level dependency
+        try:
+            import torch as _torch
+            if getattr(_torch, "cuda", None) and _torch.cuda.is_available():
+                model.to("cuda")
+        except Exception:
+            # torch not available or CUDA not present; continue on CPU
+            pass
 
         model.eval()
         return True
@@ -147,7 +162,7 @@ def _process_and_store(file_path: str):
     except Exception:
         PyPDFLoader = None
         RecursiveCharacterTextSplitter = None
-
+    # Ensure the uploaded file is removed from disk after processing
     try:
         if PyPDFLoader is None:
             # fallback to pypdf
@@ -196,10 +211,16 @@ def _process_and_store(file_path: str):
             vectorstore = DummyVectorStore.from_documents(chunks)
 
         session_id = str(uuid4())
-        sessions[session_id] = {"vectorstores": [vectorstore], "last_accessed": time.time()}
+        with sessions_lock:
+            sessions[session_id] = {"vectorstores": [vectorstore], "last_accessed": time.time()}
         return session_id
-    except Exception as e:
-        raise
+    finally:
+        try:
+            if file_path and os.path.exists(file_path):
+                os.remove(file_path)
+        except OSError:
+            # best-effort cleanup; do not mask original exceptions
+            pass
 
 
 # ===============================
@@ -207,18 +228,21 @@ def _process_and_store(file_path: str):
 # ===============================
 def cleanup_expired_sessions():
     current_time = time.time()
-    expired = [
-        sid for sid, data in sessions.items()
-        if current_time - data["last_accessed"] > SESSION_TIMEOUT
-    ]
-    for sid in expired:
-        del sessions[sid]
+    with sessions_lock:
+        expired = [
+            sid for sid, data in list(sessions.items())
+            if current_time - data["last_accessed"] > SESSION_TIMEOUT
+        ]
+        for sid in expired:
+            del sessions[sid]
 
 
 def generate_response(prompt: str, max_new_tokens: int = 200) -> str:
-    # If generation model or tokenizer are unavailable, return a harmless placeholder.
+    # If generation model or tokenizer are unavailable, raise a clear error so
+    # callers can translate it into an HTTP/JSON error response rather than
+    # treating a placeholder string as a valid answer.
     if not load_generation_model():
-        return "[model-unavailable]"
+        raise RuntimeError("Generation model unavailable")
 
     device = next(model.parameters()).device
     inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
@@ -259,40 +283,59 @@ def readiness_check():
 @app.post("/upload")
 @limiter.limit("10/15 minutes")
 async def upload_file(request: Request, file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".pdf"):
-        return {"error": "Only PDF files are supported"}
+    # Validate and sanitize filename
+    filename = os.path.basename(file.filename or "")
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
 
-    session_id = str(uuid4())
     upload_dir = "uploads"
     os.makedirs(upload_dir, exist_ok=True)
-    file_path = os.path.join(upload_dir, f"{uuid4().hex}_{file.filename}")
+    file_path = os.path.join(upload_dir, f"{uuid4().hex}_{filename}")
 
     try:
         with open(file_path, "wb") as buffer:
             buffer.write(await file.read())
 
         session_id = _process_and_store(file_path)
-
         return {"message": "PDF uploaded and processed", "session_id": session_id}
+    except HTTPException:
+        raise
     except Exception as e:
-        return {"error": f"Upload failed: {str(e)}"}
+        logger.exception("Upload failed")
+        # best-effort cleanup
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except OSError:
+            pass
+        raise HTTPException(status_code=500, detail="Upload failed")
 
 
 @app.post("/upload/anonymous")
 @limiter.limit("10/15 minutes")
 async def upload_anonymous(request: Request, file: UploadFile = File(...)):
-    if not file.filename.lower().endswith(".pdf"):
-        return {"error": "Only PDF files are supported"}
+    filename = os.path.basename(file.filename or "")
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+
     upload_dir = "uploads"
     os.makedirs(upload_dir, exist_ok=True)
-    file_path = os.path.join(upload_dir, f"{uuid4().hex}_{file.filename}")
+    file_path = os.path.join(upload_dir, f"{uuid4().hex}_{filename}")
     try:
         with open(file_path, "wb") as buffer:
             buffer.write(await file.read())
         session_id = _process_and_store(file_path)
         return {"message": "PDF uploaded and processed", "session_id": session_id}
-    except Exception as e:
-        return {"error": f"Upload failed: {str(e)}"}
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Upload failed")
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except OSError:
+            pass
+        raise HTTPException(status_code=500, detail="Upload failed")
 
 
 # ===============================
@@ -307,11 +350,12 @@ def ask_question(request: Request, data: AskRequest):
         return {"answer": "No session selected."}
 
     vectorstores = []
-    for sid in data.session_ids:
-        session = sessions.get(sid)
-        if session:
-            session["last_accessed"] = time.time()
-            vectorstores.extend(session["vectorstores"])
+    with sessions_lock:
+        for sid in data.session_ids:
+            session = sessions.get(sid)
+            if session:
+                session["last_accessed"] = time.time()
+                vectorstores.extend(session["vectorstores"])
 
     if not vectorstores:
         return {"answer": "No documents found for selected sessions."}
@@ -330,9 +374,15 @@ def ask_question(request: Request, data: AskRequest):
         f"Context:\n{context}\n\n"
         f"Question: {data.question}\nAnswer:"
     )
-
-    answer = generate_response(prompt, 200)
-    return {"answer": answer}
+    try:
+        answer = generate_response(prompt, 200)
+        return {"answer": answer}
+    except RuntimeError as e:
+        logger.warning("Generation unavailable: %s", e)
+        return JSONResponse(status_code=503, content={"answer": None, "error": str(e)})
+    except Exception as e:
+        logger.exception("Generation failed")
+        return JSONResponse(status_code=500, content={"answer": None, "error": "Generation failed"})
 
 
 # ===============================
@@ -347,10 +397,12 @@ def summarize_pdf(request: Request, data: SummarizeRequest):
         return {"summary": "No session selected."}
 
     vectorstores = []
-    for sid in data.session_ids:
-        session = sessions.get(sid)
-        if session:
-            vectorstores.extend(session["vectorstores"])
+    with sessions_lock:
+        for sid in data.session_ids:
+            session = sessions.get(sid)
+            if session:
+                session["last_accessed"] = time.time()
+                vectorstores.extend(session["vectorstores"])
 
     if not vectorstores:
         return {"summary": "No documents found."}
@@ -362,9 +414,15 @@ def summarize_pdf(request: Request, data: SummarizeRequest):
     context = "\n\n".join([d.page_content for d in docs])
 
     prompt = f"Summarize this document:\n\n{context}\n\nSummary:"
-    summary = generate_response(prompt, 250)
-
-    return {"summary": summary}
+    try:
+        summary = generate_response(prompt, 250)
+        return {"summary": summary}
+    except RuntimeError as e:
+        logger.warning("Generation unavailable: %s", e)
+        return JSONResponse(status_code=503, content={"summary": None, "error": str(e)})
+    except Exception as e:
+        logger.exception("Generation failed")
+        return JSONResponse(status_code=500, content={"summary": None, "error": "Generation failed"})
 
 
 # ===============================
@@ -378,13 +436,15 @@ def compare_documents(request: Request, data: CompareRequest):
         return {"comparison": "Select at least 2 documents."}
 
     contexts = []
-    for sid in data.session_ids:
-        session = sessions.get(sid)
-        if session:
-            vs = session["vectorstores"][0]
-            chunks = vs.similarity_search("main topics", k=4)
-            text = "\n".join([c.page_content for c in chunks])
-            contexts.append(text)
+    with sessions_lock:
+        for sid in data.session_ids:
+            session = sessions.get(sid)
+            if session:
+                session["last_accessed"] = time.time()
+                vs = session["vectorstores"][0]
+                chunks = vs.similarity_search("main topics", k=4)
+                text = "\n".join([c.page_content for c in chunks])
+                contexts.append(text)
 
     if len(contexts) < 2:
         return {"comparison": "Not enough documents to compare."}
@@ -396,9 +456,15 @@ def compare_documents(request: Request, data: CompareRequest):
         "Give similarities and differences.\n\n"
         f"{combined}\n\nComparison:"
     )
-
-    comparison = generate_response(prompt, 300)
-    return {"comparison": comparison}
+    try:
+        comparison = generate_response(prompt, 300)
+        return {"comparison": comparison}
+    except RuntimeError as e:
+        logger.warning("Generation unavailable: %s", e)
+        return JSONResponse(status_code=503, content={"comparison": None, "error": str(e)})
+    except Exception as e:
+        logger.exception("Generation failed")
+        return JSONResponse(status_code=500, content={"comparison": None, "error": "Generation failed"})
 
 
 @app.get("/health")
