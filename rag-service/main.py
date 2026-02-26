@@ -18,8 +18,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from slowapi.errors import RateLimitExceeded
 
+from slowapi import _rate_limit_exceeded_handler
+
 from api.routes import router
-from core.config import _rate_limit_exceeded_handler, limiter
+from core.config import limiter
 
 app = FastAPI(
     title="PDF QA Bot API",
