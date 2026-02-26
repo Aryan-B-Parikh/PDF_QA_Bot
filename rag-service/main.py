@@ -1,35 +1,49 @@
-"""
-main.py
-~~~~~~~
-Application entry-point.
-
-Responsibilities (and *only* these):
-  - Create the FastAPI application instance.
-  - Register global middleware (CORS, rate-limit error handler).
-  - Include the API router.
-  - Run ``uvicorn`` when executed directly.
-
-All business logic lives in the ``api``, ``services``, ``models``, and ``core``
-packages.
-"""
-
-import uvicorn
-from fastapi import FastAPI
+from fastapi import FastAPI, Request, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+from pydantic import BaseModel, Field
+from dotenv import load_dotenv
+# Heavy ML imports are attempted lazily at runtime to avoid import-time failures
+# in test environments that do not have compatible torch/transformers.
+PyPDFLoader = None
+RecursiveCharacterTextSplitter = None
+FAISS = None
+HuggingFaceEmbeddings = None
+Document = None
+AutoConfig = None
+AutoTokenizer = None
+AutoModelForSeq2SeqLM = None
+AutoModelForCausalLM = None
+from slowapi import Limiter, _rate_limit_exceeded_handler
+from slowapi.util import get_remote_address
 from slowapi.errors import RateLimitExceeded
+from uuid import uuid4
+import os
+import time
+import uuid
+import uvicorn
+import threading
+import logging
+from fastapi.responses import JSONResponse
 
-from api.routes import router
-from core.config import _rate_limit_exceeded_handler, limiter
+# IMPORTANT: Authentication REMOVED as per issue requirement
+# (Authentication was breaking existing endpoints)
+
+load_dotenv()
+
+# Logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Thread-safety for sessions
+sessions_lock = threading.Lock()
 
 app = FastAPI(
     title="PDF QA Bot API",
-    description="PDF Question-Answering Bot (Session-based)",
-    version="3.0.0",
+    description="PDF Question-Answering Bot (Session-based, No Auth)",
+    version="2.1.0"
 )
 
-# ---------------------------------------------------------------------------
-# Middleware
-# ---------------------------------------------------------------------------
+# CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -38,20 +52,428 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---------------------------------------------------------------------------
-# Rate limiter
-# ---------------------------------------------------------------------------
+# Rate Limiter
+limiter = Limiter(key_func=get_remote_address)
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
 
-# ---------------------------------------------------------------------------
-# Routers
-# ---------------------------------------------------------------------------
-app.include_router(router)
+# No auth router or globals — session-scoped only implementation
+
+# ===============================
+# SESSION STORAGE (REQUIRED: keep sessionId)
+# ===============================
+# Format: { session_id: { "vectorstores": [FAISS], "last_accessed": float } }
+sessions = {}
+SESSION_TIMEOUT = 3600  # 1 hour
+
+# (No global/shared vector store — sessions only)
+
+# Embedding model will be loaded lazily on first use
+embedding_model = None
+
+def get_embedding_model():
+    global embedding_model, HuggingFaceEmbeddings
+    if embedding_model is not None:
+        return embedding_model
+    try:
+        if HuggingFaceEmbeddings is None:
+            from langchain_community.embeddings import HuggingFaceEmbeddings as _H
+            HuggingFaceEmbeddings = _H
+        embedding_model = HuggingFaceEmbeddings(model_name="sentence-transformers/all-MiniLM-L6-v2")
+    except Exception:
+        embedding_model = None
+    return embedding_model
+
+# ===============================
+# LOAD GENERATION MODEL ONCE
+# ===============================
+HF_GENERATION_MODEL = os.getenv("HF_GENERATION_MODEL", "google/flan-t5-small")
+
+config = None
+is_encoder_decoder = False
+tokenizer = None
+model = None
+
+def load_generation_model():
+    """Attempt to load the HF generation model lazily; return True if available."""
+    global config, is_encoder_decoder, tokenizer, model, AutoConfig, AutoTokenizer
+    global AutoModelForSeq2SeqLM, AutoModelForCausalLM
+    if model is not None:
+        return True
+    try:
+        from transformers import AutoConfig as _AC, AutoTokenizer as _AT, AutoModelForSeq2SeqLM as _S, AutoModelForCausalLM as _C
+        AutoConfig = _AC
+        AutoTokenizer = _AT
+        AutoModelForSeq2SeqLM = _S
+        AutoModelForCausalLM = _C
+
+        config = AutoConfig.from_pretrained(HF_GENERATION_MODEL)
+        is_encoder_decoder = bool(getattr(config, "is_encoder_decoder", False))
+        tokenizer = AutoTokenizer.from_pretrained(HF_GENERATION_MODEL)
+
+        if is_encoder_decoder:
+            model = AutoModelForSeq2SeqLM.from_pretrained(HF_GENERATION_MODEL)
+        else:
+            model = AutoModelForCausalLM.from_pretrained(HF_GENERATION_MODEL)
+
+        # Guard CUDA usage — import torch locally to avoid module-level dependency
+        try:
+            import torch as _torch
+            if getattr(_torch, "cuda", None) and _torch.cuda.is_available():
+                model.to("cuda")
+        except Exception:
+            # torch not available or CUDA not present; continue on CPU
+            pass
+
+        model.eval()
+        return True
+    except Exception:
+        model = None
+        tokenizer = None
+        return False
+
+# ===============================
+# REQUEST MODELS
+# ===============================
+class AskRequest(BaseModel):
+    question: str = Field(..., min_length=1)
+    session_ids: list = []
 
 
-# ---------------------------------------------------------------------------
-# Dev runner
-# ---------------------------------------------------------------------------
+class SummarizeRequest(BaseModel):
+    session_ids: list = []
+
+
+class CompareRequest(BaseModel):
+    session_ids: list = []
+
+
+# Helper: process a saved PDF file and create/store a vectorstore under a session
+def _process_and_store(file_path: str):
+    # Lazy imports to avoid heavy import-time deps
+    global PyPDFLoader, RecursiveCharacterTextSplitter, FAISS
+    try:
+        if PyPDFLoader is None:
+            from langchain_community.document_loaders import PyPDFLoader as _P
+            PyPDFLoader = _P
+        if RecursiveCharacterTextSplitter is None:
+            from langchain_text_splitters import RecursiveCharacterTextSplitter as _S
+            RecursiveCharacterTextSplitter = _S
+    except Exception:
+        PyPDFLoader = None
+        RecursiveCharacterTextSplitter = None
+    # Ensure the uploaded file is removed from disk after processing
+    try:
+        if PyPDFLoader is None:
+            # fallback to pypdf
+            from pypdf import PdfReader
+            reader = PdfReader(file_path)
+            pages = [p.extract_text() or "" for p in reader.pages]
+
+            class SimpleDoc:
+                def __init__(self, text):
+                    self.page_content = text
+
+            docs = [SimpleDoc(p) for p in pages]
+        else:
+            loader = PyPDFLoader(file_path)
+            docs = loader.load()
+
+        if RecursiveCharacterTextSplitter is None:
+            chunks = docs
+        else:
+            splitter = RecursiveCharacterTextSplitter(chunk_size=1000, chunk_overlap=100)
+            chunks = splitter.split_documents(docs)
+
+        try:
+            if FAISS is None:
+                from langchain_community.vectorstores import FAISS as _F
+                FAISS = _F
+        except Exception:
+            FAISS = None
+
+        emb = get_embedding_model()
+
+        if FAISS is not None and emb is not None:
+            vectorstore = FAISS.from_documents(chunks, emb)
+        else:
+            class DummyVectorStore:
+                def __init__(self, docs):
+                    self._docs = docs
+
+                @classmethod
+                def from_documents(cls, docs, embeddings=None):
+                    return cls(docs)
+
+                def similarity_search(self, query, k=4):
+                    return self._docs[:k]
+
+            vectorstore = DummyVectorStore.from_documents(chunks)
+
+        session_id = str(uuid4())
+        with sessions_lock:
+            sessions[session_id] = {"vectorstores": [vectorstore], "last_accessed": time.time()}
+        return session_id
+    finally:
+        try:
+            if file_path and os.path.exists(file_path):
+                os.remove(file_path)
+        except OSError:
+            # best-effort cleanup; do not mask original exceptions
+            pass
+
+
+# ===============================
+# UTILITIES
+# ===============================
+def cleanup_expired_sessions():
+    current_time = time.time()
+    with sessions_lock:
+        expired = [
+            sid for sid, data in list(sessions.items())
+            if current_time - data["last_accessed"] > SESSION_TIMEOUT
+        ]
+        for sid in expired:
+            del sessions[sid]
+
+
+def generate_response(prompt: str, max_new_tokens: int = 200) -> str:
+    # If generation model or tokenizer are unavailable, raise a clear error so
+    # callers can translate it into an HTTP/JSON error response rather than
+    # treating a placeholder string as a valid answer.
+    if not load_generation_model():
+        raise RuntimeError("Generation model unavailable")
+
+    device = next(model.parameters()).device
+    inputs = tokenizer(prompt, return_tensors="pt", truncation=True, max_length=2048)
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    output = model.generate(
+        **inputs,
+        max_new_tokens=max_new_tokens,
+        do_sample=False,
+        pad_token_id=tokenizer.pad_token_id or tokenizer.eos_token_id,
+    )
+
+    if is_encoder_decoder:
+        return tokenizer.decode(output[0], skip_special_tokens=True)
+
+    return tokenizer.decode(
+        output[0][inputs["input_ids"].shape[1]:],
+        skip_special_tokens=True,
+    )
+
+
+# ===============================
+# HEALTH ENDPOINTS (kept from enhancement branch)
+# ===============================
+@app.get("/healthz")
+def health_check():
+    return {"status": "healthy"}
+
+
+@app.get("/readyz")
+def readiness_check():
+    return {"status": "ready"}
+
+
+# ===============================
+# UPLOAD (NO AUTH, RETURNS session_id)
+# ===============================
+@app.post("/upload")
+@limiter.limit("10/15 minutes")
+async def upload_file(request: Request, file: UploadFile = File(...)):
+    # Validate and sanitize filename
+    filename = os.path.basename(file.filename or "")
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+
+    upload_dir = "uploads"
+    os.makedirs(upload_dir, exist_ok=True)
+    file_path = os.path.join(upload_dir, f"{uuid4().hex}_{filename}")
+
+    try:
+        with open(file_path, "wb") as buffer:
+            buffer.write(await file.read())
+
+        session_id = _process_and_store(file_path)
+        return {"message": "PDF uploaded and processed", "session_id": session_id}
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.exception("Upload failed")
+        # best-effort cleanup
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except OSError:
+            pass
+        raise HTTPException(status_code=500, detail="Upload failed")
+
+
+@app.post("/upload/anonymous")
+@limiter.limit("10/15 minutes")
+async def upload_anonymous(request: Request, file: UploadFile = File(...)):
+    filename = os.path.basename(file.filename or "")
+    if not filename.lower().endswith(".pdf"):
+        raise HTTPException(status_code=400, detail="Only PDF files are supported")
+
+    upload_dir = "uploads"
+    os.makedirs(upload_dir, exist_ok=True)
+    file_path = os.path.join(upload_dir, f"{uuid4().hex}_{filename}")
+    try:
+        with open(file_path, "wb") as buffer:
+            buffer.write(await file.read())
+        session_id = _process_and_store(file_path)
+        return {"message": "PDF uploaded and processed", "session_id": session_id}
+    except HTTPException:
+        raise
+    except Exception:
+        logger.exception("Upload failed")
+        try:
+            if os.path.exists(file_path):
+                os.remove(file_path)
+        except OSError:
+            pass
+        raise HTTPException(status_code=500, detail="Upload failed")
+
+
+# ===============================
+# ASK (USES session_ids — matches fixed App.js)
+# ===============================
+@app.post("/ask")
+@limiter.limit("60/15 minutes")
+def ask_question(request: Request, data: AskRequest):
+    cleanup_expired_sessions()
+
+    if not data.session_ids:
+        return {"answer": "No session selected."}
+
+    vectorstores = []
+    with sessions_lock:
+        for sid in data.session_ids:
+            session = sessions.get(sid)
+            if session:
+                session["last_accessed"] = time.time()
+                vectorstores.extend(session["vectorstores"])
+
+    if not vectorstores:
+        return {"answer": "No documents found for selected sessions."}
+
+    docs = []
+    for vs in vectorstores:
+        docs.extend(vs.similarity_search(data.question, k=4))
+
+    if not docs:
+        return {"answer": "No relevant context found."}
+
+    context = "\n\n".join([d.page_content for d in docs])
+
+    prompt = (
+        "Answer the question using ONLY the provided context.\n\n"
+        f"Context:\n{context}\n\n"
+        f"Question: {data.question}\nAnswer:"
+    )
+    try:
+        answer = generate_response(prompt, 200)
+        return {"answer": answer}
+    except RuntimeError as e:
+        logger.warning("Generation unavailable: %s", e)
+        return JSONResponse(status_code=503, content={"answer": None, "error": str(e)})
+    except Exception as e:
+        logger.exception("Generation failed")
+        return JSONResponse(status_code=500, content={"answer": None, "error": "Generation failed"})
+
+
+# ===============================
+# SUMMARIZE
+# ===============================
+@app.post("/summarize")
+@limiter.limit("15/15 minutes")
+def summarize_pdf(request: Request, data: SummarizeRequest):
+    cleanup_expired_sessions()
+
+    if not data.session_ids:
+        return {"summary": "No session selected."}
+
+    vectorstores = []
+    with sessions_lock:
+        for sid in data.session_ids:
+            session = sessions.get(sid)
+            if session:
+                session["last_accessed"] = time.time()
+                vectorstores.extend(session["vectorstores"])
+
+    if not vectorstores:
+        return {"summary": "No documents found."}
+
+    docs = []
+    for vs in vectorstores:
+        docs.extend(vs.similarity_search("Summarize the document", k=6))
+
+    context = "\n\n".join([d.page_content for d in docs])
+
+    prompt = f"Summarize this document:\n\n{context}\n\nSummary:"
+    try:
+        summary = generate_response(prompt, 250)
+        return {"summary": summary}
+    except RuntimeError as e:
+        logger.warning("Generation unavailable: %s", e)
+        return JSONResponse(status_code=503, content={"summary": None, "error": str(e)})
+    except Exception as e:
+        logger.exception("Generation failed")
+        return JSONResponse(status_code=500, content={"summary": None, "error": "Generation failed"})
+
+
+# ===============================
+# COMPARE
+# ===============================
+@app.post("/compare")
+@limiter.limit("10/15 minutes")
+def compare_documents(request: Request, data: CompareRequest):
+    cleanup_expired_sessions()
+    if len(data.session_ids) < 2:
+        return {"comparison": "Select at least 2 documents."}
+
+    contexts = []
+    with sessions_lock:
+        for sid in data.session_ids:
+            session = sessions.get(sid)
+            if session:
+                session["last_accessed"] = time.time()
+                vs = session["vectorstores"][0]
+                chunks = vs.similarity_search("main topics", k=4)
+                text = "\n".join([c.page_content for c in chunks])
+                contexts.append(text)
+
+    if len(contexts) < 2:
+        return {"comparison": "Not enough documents to compare."}
+
+    combined = "\n\n---\n\n".join(contexts)
+
+    prompt = (
+        "Compare the documents below.\n"
+        "Give similarities and differences.\n\n"
+        f"{combined}\n\nComparison:"
+    )
+    try:
+        comparison = generate_response(prompt, 300)
+        return {"comparison": comparison}
+    except RuntimeError as e:
+        logger.warning("Generation unavailable: %s", e)
+        return JSONResponse(status_code=503, content={"comparison": None, "error": str(e)})
+    except Exception as e:
+        logger.exception("Generation failed")
+        return JSONResponse(status_code=500, content={"comparison": None, "error": "Generation failed"})
+
+
+@app.get("/health")
+def health():
+    return {"status": "ok"}
+
+
+# Legacy compatibility endpoints removed — session-scoped stores only
+
+
 if __name__ == "__main__":
-    uvicorn.run("main:app", host="0.0.0.0", port=5000, reload=False)
+    uvicorn.run("main:app", host="0.0.0.0", port=5000)

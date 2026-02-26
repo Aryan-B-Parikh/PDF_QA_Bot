@@ -29,8 +29,6 @@ __pycache__/
 *.pyd
 
 venv/
-.venv/
-*.db
 
 .env
 
