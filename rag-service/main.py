@@ -33,9 +33,9 @@ app.add_middleware(
 # Rate limiter
 app.state.limiter = limiter
 app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
-
 # Mount API router
 app.include_router(router)
+>>>>>>> upstream/master
 
 
 if __name__ == "__main__":
